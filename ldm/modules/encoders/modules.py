@@ -17,6 +17,107 @@ class AbstractEncoder(nn.Module):
         raise NotImplementedError
 
 
+class SecretEmbedder(AbstractEncoder):
+    def __init__(self, n_embed, secret_len=100):
+        super().__init__()
+        self.embedding = nn.Linear(secret_len, 256)
+        self.act = nn.ReLU()
+        self.out = nn.Linear(256, n_embed)
+
+    def forward(self, x):
+        x = self.act(self.embedding(x))
+        x = self.out(x)
+        return x
+    
+    def encode(self, x):
+        return self(x)
+
+
+class SecretScaler(AbstractEncoder):
+    def __init__(self, secret_len=100, resolution=64, in_channels=3):
+        import math
+        super().__init__()
+        self.in_channels = in_channels
+        self.secret_dense = nn.Linear(secret_len, 16*16*in_channels)
+        log_resolution = int(math.log(resolution, 2))
+        self.upsample = nn.Upsample(scale_factor=(2**(log_resolution-4), 2**(log_resolution-4)))
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        x = self.relu(self.secret_dense(x))
+        x = x.view((-1, self.in_channels, 16, 16))
+        return self.upsample(x)
+    
+    def encode(self, x):
+        return self(x)
+
+
+class SecretDecoder(nn.Module):
+    def __init__(self, arch='CNN', act='ReLU', norm='none', resolution=256, in_channels=3, secret_len=100):
+        super().__init__()
+        self.resolution = resolution
+        self.arch = arch
+        print(f'SecretDecoder arch: {arch}')
+        def activation(name = 'ReLU'):
+            if name == 'ReLU':
+                return nn.ReLU()
+            elif name == 'LeakyReLU':
+                return nn.LeakyReLU()
+        
+        def normalisation(name, n):
+            if name == 'none':
+                return nn.Identity()
+            elif name == 'BatchNorm2D':
+                return nn.BatchNorm2d(n)
+            elif name == 'BatchNorm1d':
+                return nn.BatchNorm1d(n)
+            elif name == 'LayerNorm':
+                return nn.LayerNorm(n)
+
+        if arch=='CNN':
+            self.decoder = nn.Sequential(
+                nn.Conv2d(in_channels, 32, (3, 3), 2, 1),  # 128
+                nn.BatchNorm2d(32),
+                activation(act),
+                nn.Conv2d(32, 32, 3, 1, 1),
+                nn.BatchNorm2d(32),
+                activation(act),
+                nn.Conv2d(32, 64, 3, 2, 1),  # 64
+                nn.BatchNorm2d(64),
+                activation(act),
+                nn.Conv2d(64, 64, 3, 1, 1),
+                nn.BatchNorm2d(64),
+                activation(act),
+                nn.Conv2d(64, 64, 3, 2, 1),  # 32
+                nn.BatchNorm2d(64),
+                activation(act),
+                nn.Conv2d(64, 128, 3, 2, 1),  # 16
+                nn.BatchNorm2d(128),
+                activation(act),
+                nn.Conv2d(128, 128, (3, 3), 2, 1),  # 8
+                nn.BatchNorm2d(128),
+                activation(act),
+            )
+            self.dense = nn.Sequential(
+                nn.Linear(resolution * resolution * 128 // 32 // 32, 512),
+                nn.BatchNorm1d(512),
+                activation(act),
+                nn.Linear(512, secret_len)
+            )
+        elif arch == 'resnet50':
+            import torchvision
+            self.decoder = torchvision.models.resnet50(pretrained=True, progress=False)
+            self.decoder.fc = nn.Linear(self.decoder.fc.in_features, secret_len)
+        else:
+            raise NotImplementedError
+
+    def forward(self, image):
+        x = self.decoder(image)
+        if self.arch == 'CNN':
+            x = x.view(-1, self.resolution * self.resolution * 128 // 32 // 32)
+            x = self.dense(x)
+        return x
+
 
 class ClassEmbedder(nn.Module):
     def __init__(self, embed_dim, n_classes=1000, key='class'):

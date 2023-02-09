@@ -109,7 +109,7 @@ def get_parser(**parser_kwargs):
         "-l",
         "--logdir",
         type=str,
-        default="logs",
+        default="/mnt/fast/nobackup/scratch4weeks/tb0035/projects/diffsteg/ldm",
         help="directory for logging dat shit",
     )
     parser.add_argument(
@@ -660,6 +660,10 @@ if __name__ == "__main__":
         trainer.logdir = logdir  ###
 
         # data
+        ## update secret length
+        secret_len = config.model.params.cond_stage_config.params.secret_len
+        config.data.params.train.params.secret_len = secret_len
+        config.data.params.validation.params.secret_len = secret_len
         data = instantiate_from_config(config.data)
         # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
         # calling these ourselves should not be necessary but it is.

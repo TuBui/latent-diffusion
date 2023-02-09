@@ -434,6 +434,8 @@ class LatentDiffusion(DDPM):
                  conditioning_key=None,
                  scale_factor=1.0,
                  scale_by_std=False,
+                 secret_loss_weight = 1.0,
+                 secret_decoder_config=None,
                  *args, **kwargs):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -443,6 +445,7 @@ class LatentDiffusion(DDPM):
             conditioning_key = 'concat' if concat_mode else 'crossattn'
         if cond_stage_config == '__is_unconditional__':
             conditioning_key = None
+        
         ckpt_path = kwargs.pop("ckpt_path", None)
         ignore_keys = kwargs.pop("ignore_keys", [])
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
@@ -459,6 +462,16 @@ class LatentDiffusion(DDPM):
             self.register_buffer('scale_factor', torch.tensor(scale_factor))
         self.instantiate_first_stage(first_stage_config)
         self.instantiate_cond_stage(cond_stage_config)
+        self.has_secret = False
+        if secret_decoder_config is not None:
+            assert conditioning_key is not None
+            secret_decoder_config.params.resolution = first_stage_config.params.ddconfig.resolution
+            secret_decoder_config.params.in_channels = first_stage_config.params.ddconfig.in_channels
+            secret_decoder_config.params.secret_len = cond_stage_config.params.secret_len
+            self.secret_decoder_model = instantiate_from_config(secret_decoder_config)
+            self.secret_loss_layer = nn.BCEWithLogitsLoss()
+            self.secret_loss_weight = secret_loss_weight
+            self.has_secret = True
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None  
@@ -664,7 +677,7 @@ class LatentDiffusion(DDPM):
             if cond_key is None:
                 cond_key = self.cond_stage_key
             if cond_key != self.first_stage_key:
-                if cond_key in ['caption', 'coordinates_bbox']:
+                if cond_key in ['caption', 'coordinates_bbox', 'secret']:
                     xc = batch[cond_key]
                 elif cond_key == 'class_label':
                     xc = batch
@@ -869,13 +882,13 @@ class LatentDiffusion(DDPM):
 
     def forward(self, x, c, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
-        if self.model.conditioning_key is not None:
-            assert c is not None
-            if self.cond_stage_trainable:
-                c = self.get_learned_conditioning(c)
-            if self.shorten_cond_schedule:  # TODO: drop this option
-                tc = self.cond_ids[t].to(self.device)
-                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
+        # if self.model.conditioning_key is not None:
+        #     assert c is not None
+        #     if self.cond_stage_trainable:
+        #         c = self.get_learned_conditioning(c)
+        #     if self.shorten_cond_schedule:  # TODO: drop this option
+        #         tc = self.cond_ids[t].to(self.device)
+        #         c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
         return self.p_losses(x, c, t, *args, **kwargs)
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
@@ -1009,7 +1022,17 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, cond, t, noise=None):
+    def p_losses(self, x_start, c, t, noise=None):
+        if self.model.conditioning_key is not None:
+            assert c is not None
+            if self.cond_stage_trainable:
+                cond = self.get_learned_conditioning(c)
+            if self.shorten_cond_schedule:  # TODO: drop this option
+                tc = self.cond_ids[t].to(self.device)
+                cond = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
+        else:
+            cond = c
+        # import pudb; pudb.set_trace()
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_output = self.apply_model(x_noisy, t, cond)
@@ -1019,10 +1042,16 @@ class LatentDiffusion(DDPM):
 
         if self.parameterization == "x0":
             target = x_start
+            x_recon = model_output
         elif self.parameterization == "eps":
             target = noise
+            x_recon = self.predict_start_from_noise(x_noisy, t, noise=model_output)
         else:
             raise NotImplementedError()
+
+        # secret decode
+        img_recon = self.differentiable_decode_first_stage(x_recon)
+        c_pred = self.secret_decoder_model(img_recon)
 
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
@@ -1033,13 +1062,21 @@ class LatentDiffusion(DDPM):
         if self.learn_logvar:
             loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
-
-        loss = self.l_simple_weight * loss.mean()
+        l_simple_weight = 0 if self.global_step < 5000 else self.l_simple_weight
+        loss = l_simple_weight * loss.mean()
 
         loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
-        loss += (self.original_elbo_weight * loss_vlb)
+        original_elbo_weight = 0 if self.global_step < 5000 else self.original_elbo_weight
+        loss += (original_elbo_weight * loss_vlb)
+
+        loss_secret = self.secret_loss_layer(c_pred.view(-1), c.view(-1))
+        loss_dict.update({f'{prefix}/loss_secret': loss_secret})
+        bit_acc = ((c_pred.detach() > 0).float() == c).float().mean()
+        loss_dict.update({f'{prefix}/bit_acc': bit_acc})
+        loss += (self.secret_loss_weight * loss_secret)
+
         loss_dict.update({f'{prefix}/loss': loss})
 
         return loss, loss_dict
