@@ -18,7 +18,8 @@ from tqdm import tqdm
 from torchvision.utils import make_grid
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from omegaconf import OmegaConf
-
+import lpips
+from kornia import color
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
 from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
@@ -433,6 +434,7 @@ class LatentDiffusion(DDPM):
                  concat_mode=True,
                  cond_stage_forward=None,
                  conditioning_key=None,
+                 loss_key='latent',  # 'latent' or 'image'
                  scale_factor=1.0,
                  scale_by_std=False,
                  secret_loss_weight = 1.0,
@@ -479,6 +481,12 @@ class LatentDiffusion(DDPM):
             self.secret_loss_layer = nn.BCEWithLogitsLoss()
             self.secret_loss_weight = secret_loss_weight
             self.has_secret = True
+        
+        self.loss_key = loss_key
+        if loss_key == 'image':
+            self.lpips_loss = lpips.LPIPS(net="alex", verbose=False)
+            self.register_buffer('yuv_scales', torch.tensor([1,100,100]).unsqueeze(1).float())  # [3,1]
+
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None  
@@ -883,8 +891,8 @@ class LatentDiffusion(DDPM):
             return self.first_stage_model.encode(x)
 
     def shared_step(self, batch, **kwargs):
-        x, c = self.get_input(batch, self.first_stage_key)
-        loss = self(x, c)
+        x, c, image, _ = self.get_input(batch, self.first_stage_key, return_first_stage_outputs=True)
+        loss = self(x, c, image=image)
         return loss
 
     def forward(self, x, c, *args, **kwargs):
@@ -1029,7 +1037,16 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, c, t, noise=None):
+    def get_image_loss(self, pred, target):
+        # pred and target are in range [-1, 1]
+        lpips_loss = self.lpips_loss(pred, target).mean(dim=[1,2,3])
+        pred_yuv = color.rgb_to_yuv((pred + 1) / 2)
+        target_yuv = color.rgb_to_yuv((target + 1) / 2)
+        yuv_loss = torch.mean((pred_yuv - target_yuv)**2, dim=[2,3])
+        yuv_loss = 1.5*torch.mm(yuv_loss, self.yuv_scales).squeeze(1)
+        return lpips_loss + yuv_loss
+
+    def p_losses(self, x_start, c, t, noise=None, image=None):
         if self.model.conditioning_key is not None:
             assert c is not None
             if self.cond_stage_trainable:
@@ -1059,8 +1076,12 @@ class LatentDiffusion(DDPM):
         # secret decode
         img_recon = self.differentiable_decode_first_stage(x_recon)
         c_pred = self.secret_decoder_model(img_recon)
-
-        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+        if self.loss_key == 'latent': 
+            loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+        else:
+            image_loss = self.get_image_loss(img_recon, image)
+            latent_loss = nn.functional.relu(nn.functional.mse_loss(model_output, target, reduction='none').mean([1,2,3]) - 0.6)
+            loss_simple = image_loss + latent_loss
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         logvar_t = self.logvar[t].to(self.device)
@@ -1077,7 +1098,8 @@ class LatentDiffusion(DDPM):
         l_simple_weight = loss_weight * self.l_simple_weight
         loss = l_simple_weight * loss.mean()
 
-        loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
+        # loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
+        loss_vlb = loss_simple
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         original_elbo_weight = loss_weight * self.original_elbo_weight
@@ -1095,10 +1117,6 @@ class LatentDiffusion(DDPM):
         return loss, loss_dict
 
     def get_simple_loss_weight(self):
-        # wait_steps = 50000  # wait 10 epochs at 1:1
-        # ramp = 4375*20  # ramp in next 20 epochs
-        # max_weight = self.simple_loss_weight_max
-        # w = 1 + min(max_weight-1, max(0., (max_weight-1)*(self.global_step - wait_steps)/ramp))
         w = self.simple_loss_weight_scheduler(self.global_step)
         return w
 
