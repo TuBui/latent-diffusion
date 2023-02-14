@@ -4,7 +4,7 @@ from functools import partial
 import clip
 from einops import rearrange, repeat
 import kornia
-
+import math
 
 from ldm.modules.x_transformer import Encoder, TransformerWrapper  # TODO: can we directly rely on lucidrains code and simply add this as a reuirement? --> test
 
@@ -22,10 +22,11 @@ class SecretEmbedder(AbstractEncoder):
         super().__init__()
         self.embedding = nn.Linear(secret_len, 256)
         self.act = nn.ReLU()
+        self.norm1 = nn.LayerNorm(256)
         self.out = nn.Linear(256, n_embed)
 
     def forward(self, x):
-        x = self.act(self.embedding(x))
+        x = self.norm1(self.act(self.embedding(x)))
         x = self.out(x)
         return x
     
@@ -35,7 +36,6 @@ class SecretEmbedder(AbstractEncoder):
 
 class SecretScaler(AbstractEncoder):
     def __init__(self, secret_len=100, resolution=64, in_channels=3):
-        import math
         super().__init__()
         self.in_channels = in_channels
         self.secret_dense = nn.Linear(secret_len, 16*16*in_channels)
@@ -47,6 +47,34 @@ class SecretScaler(AbstractEncoder):
         x = self.relu(self.secret_dense(x))
         x = x.view((-1, self.in_channels, 16, 16))
         return self.upsample(x)
+    
+    def encode(self, x):
+        return self(x)
+
+
+class SecretHybridEmbedder(AbstractEncoder):
+    def __init__(self, n_embed=512, resolution=64, secret_len=100, in_channels=3):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embedding = nn.Linear(secret_len, n_embed)
+        self.act = nn.ReLU()
+        # output for crossattn
+        self.crossattn = nn.Linear(n_embed, n_embed)
+
+        # output for concat
+        self.dense = nn.Linear(n_embed, 16*16*in_channels)
+        log_resolution = int(math.log(resolution, 2))
+        self.upsample = nn.Upsample(scale_factor=(2**(log_resolution-4), 2**(log_resolution-4)))
+
+    def forward(self, x):
+        """Need to return a dict with 2 keys: c_concat and c_crossattn, the value for each key is a tensor"""
+        x = self.act(self.embedding(x))
+        # crossattn
+        crossattn = self.act(self.crossattn(x))
+        # concat
+        concat = self.act(self.dense(x))
+        concat = self.upsample(concat.view((-1, self.in_channels, 16, 16)))
+        return {'c_concat': concat, 'c_crossattn': crossattn}
     
     def encode(self, x):
         return self(x)
@@ -77,30 +105,22 @@ class SecretDecoder(nn.Module):
         if arch=='CNN':
             self.decoder = nn.Sequential(
                 nn.Conv2d(in_channels, 32, (3, 3), 2, 1),  # 128
-                nn.BatchNorm2d(32),
                 activation(act),
                 nn.Conv2d(32, 32, 3, 1, 1),
-                nn.BatchNorm2d(32),
                 activation(act),
                 nn.Conv2d(32, 64, 3, 2, 1),  # 64
-                nn.BatchNorm2d(64),
                 activation(act),
                 nn.Conv2d(64, 64, 3, 1, 1),
-                nn.BatchNorm2d(64),
                 activation(act),
                 nn.Conv2d(64, 64, 3, 2, 1),  # 32
-                nn.BatchNorm2d(64),
                 activation(act),
                 nn.Conv2d(64, 128, 3, 2, 1),  # 16
-                nn.BatchNorm2d(128),
                 activation(act),
                 nn.Conv2d(128, 128, (3, 3), 2, 1),  # 8
-                nn.BatchNorm2d(128),
                 activation(act),
             )
             self.dense = nn.Sequential(
                 nn.Linear(resolution * resolution * 128 // 32 // 32, 512),
-                nn.BatchNorm1d(512),
                 activation(act),
                 nn.Linear(512, secret_len)
             )

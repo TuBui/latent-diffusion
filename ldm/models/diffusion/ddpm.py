@@ -17,6 +17,7 @@ from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
 from pytorch_lightning.utilities.distributed import rank_zero_only
+from omegaconf import OmegaConf
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
@@ -255,7 +256,7 @@ class DDPM(pl.LightningModule):
         b = shape[0]
         img = torch.randn(shape, device=device)
         intermediates = [img]
-        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='Sampling t', total=self.num_timesteps):
+        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='Sampling t', total=self.num_timesteps, miniters=self.num_timesteps//5, mininterval=300):
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long),
                                 clip_denoised=self.clip_denoised)
             if i % self.log_every_t == 0 or i == self.num_timesteps - 1:
@@ -436,6 +437,7 @@ class LatentDiffusion(DDPM):
                  scale_by_std=False,
                  secret_loss_weight = 1.0,
                  secret_decoder_config=None,
+                 loss_weight_config='__is_default__',
                  *args, **kwargs):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -463,6 +465,11 @@ class LatentDiffusion(DDPM):
         self.instantiate_first_stage(first_stage_config)
         self.instantiate_cond_stage(cond_stage_config)
         self.has_secret = False
+        if loss_weight_config == '__is_default__':
+            loss_weight_config = OmegaConf.create({'target': 'ldm.loss_weight_scheduler.SimpleLossWeightScheduler'})
+
+        self.simple_loss_weight_scheduler = instantiate_from_config(loss_weight_config)
+
         if secret_decoder_config is not None:
             assert conditioning_key is not None
             secret_decoder_config.params.resolution = first_stage_config.params.ddconfig.resolution
@@ -542,7 +549,7 @@ class LatentDiffusion(DDPM):
 
     def _get_denoise_row_from_list(self, samples, desc='', force_no_decoder_quantization=False):
         denoise_row = []
-        for zd in tqdm(samples, desc=desc):
+        for zd in tqdm(samples, desc=desc, miniters=len(samples)//2, mininterval=300):
             denoise_row.append(self.decode_first_stage(zd.to(self.device),
                                                             force_not_quantize=force_no_decoder_quantization))
         n_imgs_per_row = len(denoise_row)
@@ -694,7 +701,7 @@ class LatentDiffusion(DDPM):
             else:
                 c = xc
             if bs is not None:
-                c = c[:bs]
+                c = {key: val[:bs] for key, val in c.items()} if isinstance(c, dict) else c[:bs]
 
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
@@ -905,7 +912,7 @@ class LatentDiffusion(DDPM):
 
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
-            pass
+            cond = {key: [val] for key, val in cond.items()}
         else:
             if not isinstance(cond, list):
                 cond = [cond]
@@ -1062,13 +1069,18 @@ class LatentDiffusion(DDPM):
         if self.learn_logvar:
             loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
-        l_simple_weight = 0 if self.global_step < 5000 else self.l_simple_weight
+        
+        loss_weight = self.get_simple_loss_weight()
+        if prefix == 'train':
+            loss_dict.update({'train/sl_weight': loss_weight})
+
+        l_simple_weight = loss_weight * self.l_simple_weight
         loss = l_simple_weight * loss.mean()
 
         loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
-        original_elbo_weight = 0 if self.global_step < 5000 else self.original_elbo_weight
+        original_elbo_weight = loss_weight * self.original_elbo_weight
         loss += (original_elbo_weight * loss_vlb)
 
         loss_secret = self.secret_loss_layer(c_pred.view(-1), c.view(-1))
@@ -1077,9 +1089,18 @@ class LatentDiffusion(DDPM):
         loss_dict.update({f'{prefix}/bit_acc': bit_acc})
         loss += (self.secret_loss_weight * loss_secret)
 
+        loss = loss / (self.secret_loss_weight + loss_weight)
         loss_dict.update({f'{prefix}/loss': loss})
 
         return loss, loss_dict
+
+    def get_simple_loss_weight(self):
+        # wait_steps = 50000  # wait 10 epochs at 1:1
+        # ramp = 4375*20  # ramp in next 20 epochs
+        # max_weight = self.simple_loss_weight_max
+        # w = 1 + min(max_weight-1, max(0., (max_weight-1)*(self.global_step - wait_steps)/ramp))
+        w = self.simple_loss_weight_scheduler(self.global_step)
+        return w
 
     def p_mean_variance(self, x, c, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
                         return_x0=False, score_corrector=None, corrector_kwargs=None):
@@ -1171,7 +1192,7 @@ class LatentDiffusion(DDPM):
         if start_T is not None:
             timesteps = min(timesteps, start_T)
         iterator = tqdm(reversed(range(0, timesteps)), desc='Progressive Generation',
-                        total=timesteps) if verbose else reversed(
+                        total=timesteps, miniters=timesteps//5, mininterval=300) if verbose else reversed(
             range(0, timesteps))
         if type(temperature) == float:
             temperature = [temperature] * timesteps
@@ -1220,7 +1241,7 @@ class LatentDiffusion(DDPM):
 
         if start_T is not None:
             timesteps = min(timesteps, start_T)
-        iterator = tqdm(reversed(range(0, timesteps)), desc='Sampling t', total=timesteps) if verbose else reversed(
+        iterator = tqdm(reversed(range(0, timesteps)), desc='Sampling t', total=timesteps, miniters=timesteps//5, mininterval=300) if verbose else reversed(
             range(0, timesteps))
 
         if mask is not None:
@@ -1300,7 +1321,7 @@ class LatentDiffusion(DDPM):
         N = min(x.shape[0], N)
         n_row = min(x.shape[0], n_row)
         log["inputs"] = x
-        log["reconstruction"] = xrec
+        # log["reconstruction"] = xrec
         if self.model.conditioning_key is not None:
             if hasattr(self.cond_stage_model, "decode"):
                 xc = self.cond_stage_model.decode(c)
@@ -1371,7 +1392,7 @@ class LatentDiffusion(DDPM):
                                                 ddim_steps=ddim_steps, x0=z[:N], mask=mask)
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_inpainting"] = x_samples
-                log["mask"] = mask
+                # log["mask"] = mask
 
                 # outpaint
                 with self.ema_scope("Plotting Outpaint"):
