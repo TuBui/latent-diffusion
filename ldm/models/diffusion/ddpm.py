@@ -1080,8 +1080,8 @@ class LatentDiffusion(DDPM):
             loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         else:
             image_loss = self.get_image_loss(img_recon, image)
-            latent_loss = nn.functional.relu(nn.functional.mse_loss(model_output, target, reduction='none').mean([1,2,3]) - 0.6)
-            loss_simple = image_loss + latent_loss
+            latent_loss = nn.functional.relu(nn.functional.mse_loss(model_output, target, reduction='none').mean([1,2,3]) - 0.04)
+            loss_simple = 0.1*image_loss + latent_loss
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         logvar_t = self.logvar[t].to(self.device)
