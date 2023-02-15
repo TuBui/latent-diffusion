@@ -4,6 +4,8 @@ import time
 import torch
 import torchvision
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ProgressBar
+from pathlib import Path
 
 from packaging import version
 from omegaconf import OmegaConf
@@ -19,7 +21,8 @@ from pytorch_lightning.utilities import rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
-
+import warnings
+warnings.filterwarnings(action='ignore', category=DeprecationWarning)
 
 def get_parser(**parser_kwargs):
     def str2bool(v):
@@ -106,10 +109,10 @@ def get_parser(**parser_kwargs):
         help="post-postfix for default name",
     )
     parser.add_argument(
-        "-l",
+        "-o",
         "--logdir",
         type=str,
-        default="logs",
+        default="/mnt/fast/nobackup/scratch4weeks/tb0035/projects/diffsteg/ldm",
         help="directory for logging dat shit",
     )
     parser.add_argument(
@@ -457,7 +460,7 @@ if __name__ == "__main__":
     #           params:
     #               key: value
 
-    now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    now = ''  # datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
     # add cwd for convenience and to make classes in this file available when
     # running as `python main.py`
@@ -468,12 +471,24 @@ if __name__ == "__main__":
     parser = Trainer.add_argparse_args(parser)
 
     opt, unknown = parser.parse_known_args()
-    if opt.name and opt.resume:
-        raise ValueError(
-            "-n/--name and -r/--resume cannot be specified both."
-            "If you want to resume training in a new log folder, "
-            "use -n/--name in combination with --resume_from_checkpoint"
-        )
+    if opt.name:
+        name = opt.name
+    elif opt.base:
+        cfg_fname = os.path.split(opt.base[0])[-1]
+        cfg_name = os.path.splitext(cfg_fname)[0]
+        name = cfg_name
+    else:
+        name = ""
+    nowname = now + name + opt.postfix
+    logdir = os.path.join(opt.logdir, nowname)
+    ckptdir = os.path.join(logdir, "checkpoints")
+    cfgdir = os.path.join(logdir, "configs")
+    seed_everything(opt.seed)
+    if os.path.exists(os.path.join(ckptdir,'last.ckpt')):
+        opt.resume = logdir 
+    else:
+        opt.resume = ''
+
     if opt.resume:
         if not os.path.exists(opt.resume):
             raise ValueError("Cannot find {}".format(opt.resume))
@@ -493,20 +508,7 @@ if __name__ == "__main__":
         opt.base = base_configs + opt.base
         _tmp = logdir.split("/")
         nowname = _tmp[-1]
-    else:
-        if opt.name:
-            name = "_" + opt.name
-        elif opt.base:
-            cfg_fname = os.path.split(opt.base[0])[-1]
-            cfg_name = os.path.splitext(cfg_fname)[0]
-            name = "_" + cfg_name
-        else:
-            name = ""
-        nowname = now + name + opt.postfix
-        logdir = os.path.join(opt.logdir, nowname)
 
-    ckptdir = os.path.join(logdir, "checkpoints")
-    cfgdir = os.path.join(logdir, "configs")
     seed_everything(opt.seed)
 
     try:
@@ -654,7 +656,7 @@ if __name__ == "__main__":
         elif 'ignore_keys_callback' in callbacks_cfg:
             del callbacks_cfg['ignore_keys_callback']
 
-        trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
+        trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg] + [ProgressBar(refresh_rate=50)]
 
         trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
         trainer.logdir = logdir  ###
